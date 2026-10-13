@@ -1,0 +1,1 @@
+# csmoney-cookie-gen
