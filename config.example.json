@@ -1,0 +1,41 @@
+{
+  "settings": {
+    "data_dir": "data",
+    "headless": true,
+    "browser_concurrency": 2,
+    "login_attempts": 2,
+    "http_backend": "aiohttp",
+    "verify_interval": 600
+  },
+  "accounts": [
+    {
+      "account_id": "main",
+      "proxy": "socks5://user:password@203.0.113.10:1080",
+      "steam": {
+        "mafile": "maFiles/76561198000000001.maFile"
+      }
+    },
+    {
+      "account_id": "second",
+      "proxy": "http://user:password@203.0.113.11:8080",
+      "steam_id": "76561198000000002",
+      "steam": {
+        "cookies": {
+          "steamLoginSecure": "76561198000000002%7C%7CeyJ...",
+          "sessionid": "0123456789abcdef01234567",
+          "steamRefresh_steam": "76561198000000002%7C%7CeyJ..."
+        }
+      }
+    },
+    {
+      "account_id": "third",
+      "proxy": "203.0.113.12:3128:user:password",
+      "steam": {
+        "refresh_token": "eyJ...",
+        "username": "steam_login",
+        "password": "steam_password",
+        "shared_secret": "base64secret="
+      }
+    }
+  ]
+}

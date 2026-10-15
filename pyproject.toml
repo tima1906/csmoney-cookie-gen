@@ -1,0 +1,31 @@
+[project]
+name = "csmoney-cookie-gen"
+version = "0.1.0"
+description = "CS.MONEY sessions through Steam OpenID in Camoufox, stored together with their proxy"
+requires-python = ">=3.12"
+dependencies = [
+    "aiosteampy[socks]==1.0.0b16",
+    "camoufox[geoip]>=0.5.8",
+    "aiohttp>=3.12",
+    "aiohttp-socks>=0.10",
+    "python-socks>=2.5",
+    "cryptography>=43",
+]
+
+[project.optional-dependencies]
+httpx = ["httpx[socks]>=0.28"]
+dev = ["pytest>=8", "pytest-asyncio>=0.24", "ruff"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP", "SIM", "ASYNC", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["SIM117"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

@@ -1,0 +1,15 @@
+# aiosteampy: the 1.x line has no stable release yet; 1.0.0b16 (2026-09-10) is the newest. Pinned because
+# the beta API may still change.
+aiosteampy[socks]==1.0.0b16
+camoufox[geoip]>=0.5.8
+aiohttp>=3.12
+aiohttp-socks>=0.10
+python-socks>=2.5
+cryptography>=43
+
+# optional second HTTP backend (settings.http_backend = "httpx")
+httpx[socks]>=0.28
+
+# tests
+pytest>=8
+pytest-asyncio>=0.24
