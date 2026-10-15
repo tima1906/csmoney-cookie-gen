@@ -8,11 +8,13 @@ from csmoney_auth.browser import BrowserLoginResult
 from csmoney_auth.core import (
     Account,
     BrowserTimeoutError,
+    CsMoneySession,
     ProxyConfig,
     ReauthNotAllowed,
     SessionStatus,
     Settings,
     SteamCredentials,
+    SteamOpenIdRejected,
     SteamSessionRejected,
     StoredCookie,
     WrongSteamAccount,
@@ -275,3 +277,106 @@ async def test_ensure_all_limits_parallel_logins(store):
     results = await manager.ensure_all()
     assert all(not isinstance(r, BaseException) for r in results.values()) and len(results) == 6
     assert peak == 2
+
+
+def _stored_session(aid: str, *, verified_offset: float = 0.0) -> CsMoneySession:
+    now = time.time()
+    return CsMoneySession(
+        account_id=aid,
+        steam_id=STEAM_ID,
+        cookies=[StoredCookie("csgo_ses", "x", "cs.money")],
+        proxy=None,
+        user_agent="ua",
+        created_at=now,
+        expires_at=now + 86400,
+        status=SessionStatus.ACTIVE,
+        last_verified_at=now + verified_offset,
+    )
+
+
+# ── item 1: permanent failures block an account until its credentials/proxy change or --force ──
+
+
+async def test_permanent_failure_blocks_even_after_cooldown(store):
+    browser = FakeBrowser(SteamOpenIdRejected("Steam says no"))
+    manager, _ = make_manager(store, browser, login_attempts=1, reauth_cooldown=0)  # cooldown=0 isolates the block
+    with pytest.raises(SteamOpenIdRejected):
+        await manager.ensure_session("acc")
+    attempts = await store.get_login_attempts("acc")
+    assert attempts.permanent and attempts.fingerprint
+    with pytest.raises(ReauthNotAllowed):  # blocked despite the elapsed cooldown
+        await manager.ensure_session("acc")
+    assert browser.calls == 1  # the second call never reached the browser
+
+
+async def test_force_overrides_a_permanent_block_and_success_clears_it(store):
+    browser = FakeBrowser(SteamOpenIdRejected("Steam says no"))
+    manager, _ = make_manager(store, browser, login_attempts=1, reauth_cooldown=0)
+    with pytest.raises(SteamOpenIdRejected):
+        await manager.ensure_session("acc")
+    session = await manager.ensure_session("acc", force=True)  # browser now succeeds
+    assert session.status is SessionStatus.ACTIVE
+    assert not (await store.get_login_attempts("acc")).permanent  # a success clears the block
+
+
+async def test_changing_credentials_lifts_a_permanent_block(store):
+    account = Account("acc", None, SteamCredentials(username="acc", password="p1"), STEAM_ID)
+    browser = FakeBrowser(SteamOpenIdRejected("Steam says no"))
+    settings = Settings(login_attempts=1, reauth_cooldown=0, backoff_base=0.01)
+    manager = SessionManager(settings, [account], store, FakeSteam(), browser)
+    manager._verify_new = _skip_verify
+    with pytest.raises(SteamOpenIdRejected):
+        await manager.ensure_session("acc")
+    with pytest.raises(ReauthNotAllowed):
+        await manager.ensure_session("acc")
+    account.steam.password = "p2"  # operator edits the account
+    session = await manager.ensure_session("acc")  # block no longer applies
+    assert session.status is SessionStatus.ACTIVE
+
+
+async def test_transient_failure_is_not_a_permanent_block(store):
+    browser = FakeBrowser(BrowserTimeoutError("x"), BrowserTimeoutError("x"))
+    manager, _ = make_manager(store, browser, login_attempts=2)
+    with pytest.raises(BrowserTimeoutError):
+        await manager.ensure_session("acc")
+    assert not (await store.get_login_attempts("acc")).permanent
+
+
+# ── item 3: stored sessions are checked before (and apart from) browser logins ──
+
+
+async def test_ensure_all_reuses_valid_sessions_without_the_browser(store):
+    accounts = [Account(f"a{i}", None, SteamCredentials(), None) for i in range(3)]
+    browser = FakeBrowser()
+    manager = SessionManager(Settings(browser_concurrency=2), accounts, store, FakeSteam(), browser)
+    manager._verify_new = _skip_verify
+    for aid in ("a0", "a1"):
+        await store.save(_stored_session(aid))
+    results = await manager.ensure_all()
+    assert list(results) == ["a0", "a1", "a2"]  # order preserved
+    assert all(not isinstance(r, BaseException) for r in results.values())
+    assert browser.calls == 1  # only a2 had no stored session
+
+
+async def test_session_checks_run_wider_than_browser_concurrency(store):
+    import asyncio
+
+    running = peak = 0
+
+    async def slow_check(session):
+        nonlocal running, peak
+        running += 1
+        peak = max(peak, running)
+        await asyncio.sleep(0.03)
+        running -= 1
+        return SessionStatus.ACTIVE, None
+
+    accounts = [Account(f"a{i}", None, SteamCredentials(), None) for i in range(4)]
+    settings = Settings(browser_concurrency=1, verify_jobs=4)
+    manager = SessionManager(settings, accounts, store, FakeSteam(), FakeBrowser())
+    manager._check = slow_check
+    for a in accounts:
+        await store.save(_stored_session(a.account_id, verified_offset=-10000))  # stale -> forces a check
+    results = await manager.ensure_all()
+    assert all(not isinstance(r, BaseException) for r in results.values())
+    assert peak == 4  # checks ran 4-wide though only one browser login is allowed at a time

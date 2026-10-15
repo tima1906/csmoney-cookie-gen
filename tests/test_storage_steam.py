@@ -87,6 +87,15 @@ async def test_login_attempts_counter(store):
     assert (await store.get_login_attempts("acc")).consecutive_failures == 0
 
 
+async def test_login_attempts_permanent_flag_and_fingerprint(store):
+    await store.record_login_attempt("acc", ok=False, error="blocked", permanent=True, fingerprint="fp1")
+    attempts = await store.get_login_attempts("acc")
+    assert attempts.permanent is True and attempts.fingerprint == "fp1"
+    await store.record_login_attempt("acc", ok=True)  # a success clears the block and the fingerprint
+    cleared = await store.get_login_attempts("acc")
+    assert cleared.permanent is False and cleared.fingerprint is None
+
+
 def test_key_file_created_once(tmp_path, monkeypatch):
     monkeypatch.delenv("CSMONEY_STORE_KEY", raising=False)
     key_file = tmp_path / "k" / "store.key"

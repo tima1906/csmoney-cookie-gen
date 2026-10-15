@@ -12,9 +12,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import logging
 import time
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator, Callable, Iterable
 from typing import TYPE_CHECKING
 
 from .client import CsMoneyHttpClient, backoff_delay
@@ -28,14 +29,18 @@ from .core import (
     CsMoneySession,
     NetworkError,
     ReauthNotAllowed,
+    RegistrationRequired,
     ResponseKind,
     ServiceUnavailableError,
     SessionInvalidError,
     SessionStatus,
     Settings,
     SteamAuthError,
+    SteamCredentialsRejected,
     SteamGuardRequired,
+    SteamOpenIdRejected,
     SteamSessionRejected,
+    WrongSteamAccount,
     redact,
     session_expiry,
 )
@@ -57,7 +62,40 @@ _TRANSIENT = (
     SteamSessionRejected,
 )
 
+# failures that retrying as-is cannot fix: the account is blocked until its credentials/proxy change or --force.
+# Steam's own rate limit stays out of this list - it is temporary and handled by the normal cooldown.
+_PERMANENT = (
+    SteamOpenIdRejected,
+    SteamCredentialsRejected,
+    SteamGuardRequired,
+    WrongSteamAccount,
+    RegistrationRequired,
+    ConfigError,
+)
+
 _EXPIRY_MARGIN = 60.0
+
+
+def _account_fingerprint(account: Account) -> str:
+    """A stable hash of the account's Steam credentials and proxy, so a change clears a permanent block.
+
+    Taken from the config (not from the stored Steam state, which rotates on its own), so it is stable
+    across runs until the operator edits the account.
+    """
+    s = account.steam
+    material = "\x00".join(
+        [
+            s.username or "",
+            s.password or "",
+            s.shared_secret or "",
+            s.refresh_token or "",
+            s.access_token or "",
+            s.cookies.get("steamLoginSecure", ""),
+            s.cookies.get("steamRefresh_steam", ""),
+            account.proxy.url if account.proxy else "",
+        ]
+    )
+    return hashlib.sha256(material.encode()).hexdigest()[:32]
 
 
 class SessionManager:
@@ -124,19 +162,56 @@ class SessionManager:
             return await self._login(account, ignore_cooldown=force)
 
     async def ensure_all(
-        self, account_ids: Iterable[str] | None = None, *, force: bool = False
+        self,
+        account_ids: Iterable[str] | None = None,
+        *,
+        force: bool = False,
+        on_result: Callable[[str, CsMoneySession | BaseException], None] | None = None,
     ) -> dict[str, CsMoneySession | BaseException]:
+        """Ensure sessions for every account. ``on_result`` (if given) is called as each account finishes.
+
+        Two phases: stored sessions are checked over HTTP widely in parallel first, then only the accounts
+        that still need one go through a browser login, capped at ``browser_concurrency`` (each browser login
+        also signs in to Steam, and dozens of simultaneous Steam sign-ins from one machine are rate-limited).
+        """
         ids = list(account_ids or self._accounts)
-        # Steam logins happen before a browser slot is taken, so the whole per-account work is limited here:
-        # dozens of simultaneous Steam sign-ins from one machine would be rate-limited.
-        limit = asyncio.Semaphore(self._settings.browser_concurrency)
+        results: dict[str, CsMoneySession | BaseException] = {}
 
-        async def one(account_id: str) -> CsMoneySession:
-            async with limit:
-                return await self.ensure_session(account_id, force=force)
+        def record(account_id: str, outcome: CsMoneySession | BaseException) -> None:
+            results[account_id] = outcome
+            if on_result is not None:
+                on_result(account_id, outcome)
 
-        results = await asyncio.gather(*(one(a) for a in ids), return_exceptions=True)
-        return dict(zip(ids, results, strict=True))
+        pending: list[str] = list(ids)
+        if not force:
+            reuse_limit = asyncio.Semaphore(max(self._settings.browser_concurrency, self._settings.verify_jobs))
+
+            async def reuse_one(account_id: str) -> str | None:
+                try:
+                    async with reuse_limit, self._lock(account_id):
+                        outcome = await self._reuse(self.account(account_id))
+                except Exception as e:  # reported per account, like the browser phase
+                    outcome = e
+                if outcome is None:
+                    return account_id  # no valid stored session -> needs a browser login
+                record(account_id, outcome)
+                return None
+
+            needs_login = await asyncio.gather(*(reuse_one(a) for a in ids))
+            pending = [aid for aid in needs_login if aid is not None]
+
+        login_limit = asyncio.Semaphore(self._settings.browser_concurrency)
+
+        async def login_one(account_id: str) -> None:
+            try:
+                async with login_limit, self._lock(account_id):
+                    outcome = await self._login(self.account(account_id), ignore_cooldown=force)
+            except Exception as e:  # keep going for the other accounts; the caller inspects each result
+                outcome = e
+            record(account_id, outcome)
+
+        await asyncio.gather(*(login_one(a) for a in pending))
+        return {aid: results[aid] for aid in ids}
 
     async def verify(self, account_id: str) -> SessionStatus | None:
         """HTTP-only check of the stored session (no browser). None if nothing is stored."""
@@ -230,9 +305,17 @@ class SessionManager:
         logger.info("[%s] stored session is no longer valid (%s)", aid, status)
         return None
 
-    async def _check_cooldown(self, account_id: str) -> None:
-        attempts = await self._store.get_login_attempts(account_id)
+    async def _check_login_allowed(self, account: Account) -> None:
+        attempts = await self._store.get_login_attempts(account.account_id)
         if attempts is None or attempts.consecutive_failures == 0:
+            return
+        if attempts.permanent:
+            # a change to the account's credentials or proxy lifts the block; otherwise skip it entirely
+            if attempts.fingerprint == _account_fingerprint(account):
+                raise ReauthNotAllowed(
+                    f"login blocked after {attempts.consecutive_failures} failure(s) (last error: "
+                    f"{attempts.last_error}); change the account's credentials/proxy or use --force to retry"
+                )
             return
         s = self._settings
         cooldown = min(s.reauth_cooldown_max, s.reauth_cooldown * 2 ** (attempts.consecutive_failures - 1))
@@ -306,7 +389,7 @@ class SessionManager:
     async def _login(self, account: Account, *, ignore_cooldown: bool = False) -> CsMoneySession:
         aid = account.account_id
         if not ignore_cooldown:
-            await self._check_cooldown(aid)
+            await self._check_login_allowed(account)
         attempts = self._settings.login_attempts
         last_error: CsMoneyAuthError | None = None
         for attempt in range(1, attempts + 1):
@@ -350,7 +433,20 @@ class SessionManager:
 
         assert last_error is not None
         message = redact(f"{type(last_error).__name__}: {last_error}")[:500]
-        await self._store.record_login_attempt(aid, ok=False, error=message)
+        permanent = isinstance(last_error, _PERMANENT)
+        await self._store.record_login_attempt(
+            aid,
+            ok=False,
+            error=message,
+            permanent=permanent,
+            fingerprint=_account_fingerprint(account) if permanent else None,
+        )
+        if permanent:
+            logger.warning(
+                "[%s] login blocked (%s); skipped until credentials/proxy change or --force",
+                aid,
+                type(last_error).__name__,
+            )
         if await self._store.get(aid) is not None:
             await self._store.mark(aid, SessionStatus.ERROR, error=message)
         raise last_error

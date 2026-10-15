@@ -38,7 +38,15 @@ from aiosteampy.session import NetworkError as SteamNetworkError
 from aiosteampy.session import ProxyError as SteamProxyError
 from aiosteampy.transport import Cookie as SteamCookie
 
-from .core import Account, NetworkError, ProxyError, SteamAuthError, SteamGuardRequired, StoredCookie
+from .core import (
+    Account,
+    NetworkError,
+    ProxyError,
+    SteamAuthError,
+    SteamCredentialsRejected,
+    SteamGuardRequired,
+    StoredCookie,
+)
 from .store import SessionStore
 
 logger = logging.getLogger(__name__)
@@ -260,7 +268,7 @@ class SteamAuthProvider:
         except (GuardConfirmationRequired, SteamAuthError):
             raise
         except BadCredentials:
-            raise SteamAuthError("Steam rejected the credentials / Steam Guard code") from None
+            raise SteamCredentialsRejected("Steam rejected the credentials / Steam Guard code") from None
         except TooManyAttempts:
             raise SteamAuthError("Steam: too many login attempts, try again later") from None
         except (LoginError, EResultError) as e:

@@ -10,8 +10,16 @@ from pathlib import Path
 
 import pytest
 
-from csmoney_auth.__main__ import build_parser, cmd_verify, main, parse_account_line
-from csmoney_auth.core import ConfigError, CsMoneySession, NetworkError, SessionStatus, StoredCookie, load_config
+from csmoney_auth.__main__ import _available_proxies, build_parser, cmd_login, cmd_verify, main, parse_account_line
+from csmoney_auth.core import (
+    ConfigError,
+    CsMoneySession,
+    NetworkError,
+    SessionStatus,
+    SteamOpenIdRejected,
+    StoredCookie,
+    load_config,
+)
 from csmoney_auth.store import SecretBox, SessionStore
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -286,3 +294,71 @@ def test_import_reads_colon_lines_and_skips_comments(tmp_path, capsys):
         {"account_id": "alice", "steam": {"username": "alice", "password": "pw"}, "email": "alice@example.org"}
     ]
     assert "MailPass" not in capsys.readouterr().out
+
+
+# ── item 2: import does not hand out a proxy already assigned in the config ──
+
+
+def test_available_proxies_skips_used_and_duplicate():
+    accounts = [{"account_id": "old", "proxy": "http://u:p@1.1.1.1:8080"}]
+    raw = [
+        "http://u:p@1.1.1.1:8080",      # already used by "old"
+        "http://u:p@2.2.2.2:8080",      # free
+        "http://u:p@2.2.2.2:8080",      # duplicate of the previous line
+        "3.3.3.3:9000:u:p",             # free, host:port:user:pass form
+    ]
+    available, skipped = _available_proxies(raw, accounts)
+    assert available == ["http://u:p@2.2.2.2:8080", "3.3.3.3:9000:u:p"]
+    assert skipped == 2
+
+
+def test_import_skips_proxies_already_in_config(tmp_path, capsys):
+    existing = {"account_id": "old", "proxy": "http://u:p@1.1.1.1:8080"}
+    config = write_config(tmp_path, [existing])
+    source = tmp_path / "accounts.txt"
+    source.write_text("alice:pw:alice@example.org\n", encoding="utf-8")
+    proxies = tmp_path / "proxies.txt"
+    proxies.write_text("http://u:p@1.1.1.1:8080\nhttp://u:p@2.2.2.2:8080\n", encoding="utf-8")
+    assert main(["-c", str(config), "import", str(source), "--proxies", str(proxies)]) == 0
+    accounts = json.loads(config.read_text(encoding="utf-8"))["accounts"]
+    alice = next(a for a in accounts if a["account_id"] == "alice")
+    assert alice["proxy"] == "http://u:p@2.2.2.2:8080"  # not the one already taken by "old"
+    assert "skipped" in capsys.readouterr().out
+
+
+# ── item 5: login prints a summary and writes the failed ids to a file ──
+
+
+async def test_cmd_login_summary_and_failed_file(tmp_path, capsys):
+    now = time.time()
+    ok = CsMoneySession(
+        account_id="a",
+        steam_id="76561198000000001",
+        cookies=[StoredCookie("csgo_ses", "x", "cs.money")],
+        proxy=None,
+        user_agent="ua",
+        created_at=now,
+        expires_at=now + 86400,
+        status=SessionStatus.ACTIVE,
+        last_verified_at=now,
+    )
+
+    class FakeManager:
+        account_ids = ["a", "b", "c"]
+
+        async def ensure_all(self, ids, *, force, on_result):
+            outcomes = {"a": ok, "b": SteamOpenIdRejected("blocked"), "c": SteamOpenIdRejected("blocked")}
+            results = {}
+            for aid in ids:
+                results[aid] = outcomes[aid]
+                on_result(aid, outcomes[aid])
+            return results
+
+    args = argparse.Namespace(account=None, force=False, config=tmp_path / "config.json")
+    rc = await cmd_login(FakeManager(), args)
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "[1/3]" in out and "[3/3]" in out  # live progress counter
+    assert "done: 1/3 ok, 2 failed" in out
+    assert "SteamOpenIdRejected: 2" in out
+    assert (tmp_path / "failed.txt").read_text(encoding="utf-8").split() == ["b", "c"]

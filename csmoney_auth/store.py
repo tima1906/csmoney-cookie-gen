@@ -48,9 +48,27 @@ CREATE TABLE IF NOT EXISTS login_attempts (
     account_id           TEXT PRIMARY KEY,
     consecutive_failures INTEGER NOT NULL,
     last_attempt_at      REAL NOT NULL,
-    last_error           TEXT
+    last_error           TEXT,
+    permanent            INTEGER NOT NULL DEFAULT 0,  -- a failure that retrying as-is cannot fix
+    fingerprint          TEXT                         -- account credentials/proxy when blocked; a change clears it
 );
 """
+
+# columns added after the first release; ``CREATE TABLE IF NOT EXISTS`` never alters an existing table
+_MIGRATIONS = {
+    "login_attempts": {
+        "permanent": "ALTER TABLE login_attempts ADD COLUMN permanent INTEGER NOT NULL DEFAULT 0",
+        "fingerprint": "ALTER TABLE login_attempts ADD COLUMN fingerprint TEXT",
+    },
+}
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    for table, columns in _MIGRATIONS.items():
+        present = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for name, sql in columns.items():
+            if name not in present:
+                conn.execute(sql)
 
 
 class SecretBox:
@@ -89,6 +107,8 @@ class LoginAttempts:
     consecutive_failures: int
     last_attempt_at: float
     last_error: str | None
+    permanent: bool = False
+    fingerprint: str | None = None
 
 
 class SessionStore:
@@ -105,6 +125,7 @@ class SessionStore:
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(_SCHEMA)
+            _migrate(conn)
             return conn
 
         self._conn = await asyncio.to_thread(_open)
@@ -248,20 +269,40 @@ class SessionStore:
 
     async def get_login_attempts(self, account_id: str) -> LoginAttempts | None:
         row = await self._run(
-            "SELECT consecutive_failures, last_attempt_at, last_error FROM login_attempts WHERE account_id = ?",
+            "SELECT consecutive_failures, last_attempt_at, last_error, permanent, fingerprint "
+            "FROM login_attempts WHERE account_id = ?",
             (account_id,),
             fetch="one",
         )
-        return LoginAttempts(**dict(row)) if row else None
+        if row is None:
+            return None
+        return LoginAttempts(
+            consecutive_failures=row["consecutive_failures"],
+            last_attempt_at=row["last_attempt_at"],
+            last_error=row["last_error"],
+            permanent=bool(row["permanent"]),
+            fingerprint=row["fingerprint"],
+        )
 
-    async def record_login_attempt(self, account_id: str, *, ok: bool, error: str | None = None) -> None:
+    async def record_login_attempt(
+        self,
+        account_id: str,
+        *,
+        ok: bool,
+        error: str | None = None,
+        permanent: bool = False,
+        fingerprint: str | None = None,
+    ) -> None:
+        """Record the outcome. A success clears the counter, the permanent flag and the fingerprint."""
         await self._run(
             """
-            INSERT INTO login_attempts (account_id, consecutive_failures, last_attempt_at, last_error)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO login_attempts (account_id, consecutive_failures, last_attempt_at, last_error,
+                                        permanent, fingerprint)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(account_id) DO UPDATE SET
                 consecutive_failures = CASE WHEN ? THEN 0 ELSE login_attempts.consecutive_failures + 1 END,
-                last_attempt_at = excluded.last_attempt_at, last_error = excluded.last_error
+                last_attempt_at = excluded.last_attempt_at, last_error = excluded.last_error,
+                permanent = excluded.permanent, fingerprint = excluded.fingerprint
             """,
-            (account_id, 0 if ok else 1, time.time(), error, ok),
+            (account_id, 0 if ok else 1, time.time(), error, int(permanent and not ok), fingerprint, ok),
         )

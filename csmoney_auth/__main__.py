@@ -15,12 +15,14 @@ import logging
 import re
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 
 from .client import analyze_cookies
 from .core import (
     ConfigError,
     CsMoneyAuthError,
+    ProxyConfig,
     SessionNotFound,
     is_cookie_for_csmoney,
     load_config,
@@ -44,19 +46,35 @@ def _table(rows: list[list[str]], header: list[str]) -> str:
 
 async def cmd_login(manager: SessionManager, args) -> int:
     ids = args.account or manager.account_ids
-    results = await manager.ensure_all(ids, force=args.force)
-    failed = 0
-    for aid, result in results.items():
+    total = len(ids)
+    done = 0
+
+    def on_result(aid: str, result) -> None:
+        nonlocal done
+        done += 1
         if isinstance(result, BaseException):
-            failed += 1
-            print(f"{aid}: FAILED - {type(result).__name__}: {redact(str(result))}")
+            print(f"[{done}/{total}] {aid}: FAILED - {type(result).__name__}: {redact(str(result))}")
             if not isinstance(result, CsMoneyAuthError):
                 logger.error("[%s] unexpected error", aid, exc_info=result)
         else:
             print(
-                f"{aid}: OK - steam_id={result.steam_id}, {len(result.cookies)} cookies, "
+                f"[{done}/{total}] {aid}: OK - steam_id={result.steam_id}, {len(result.cookies)} cookies, "
                 f"expires {_ts(result.expires_at)}, proxy={result.proxy_config or 'direct'}"
             )
+
+    results = await manager.ensure_all(ids, force=args.force, on_result=on_result)
+    failed = {aid: r for aid, r in results.items() if isinstance(r, BaseException)}
+
+    print(f"\ndone: {total - len(failed)}/{total} ok" + (f", {len(failed)} failed" if failed else ""))
+    for name, count in Counter(type(r).__name__ for r in failed.values()).most_common():
+        print(f"  {name}: {count}")
+    if failed:
+        path = args.config.parent / "failed.txt"
+        try:
+            path.write_text("\n".join(failed) + "\n", encoding="utf-8")
+            print(f"failed account ids written to {path}")
+        except OSError as e:
+            logger.warning("could not write %s: %s", path, e)
     return 1 if failed else 0
 
 
@@ -237,11 +255,37 @@ def parse_account_line(line: str) -> tuple[str, str, str, str]:
     return login, password, "", fields[2] if len(fields) > 2 else ""
 
 
+def _proxy_key(raw: str | None) -> str | None:
+    """Canonical form of a proxy line for comparison (credentials and format differences folded out)."""
+    if not raw:
+        return None
+    try:
+        return ProxyConfig.parse(raw).url
+    except Exception:
+        return raw.strip()
+
+
+def _available_proxies(raw_proxies: list[str], accounts: list[dict]) -> tuple[list[str], int]:
+    """Proxy lines not already assigned in the config and not repeated; plus how many were dropped."""
+    used = {_proxy_key(a.get("proxy")) for a in accounts if a.get("proxy")}
+    out: list[str] = []
+    seen: set[str | None] = set()
+    skipped = 0
+    for p in raw_proxies:
+        key = _proxy_key(p)
+        if key in used or key in seen:
+            skipped += 1
+            continue
+        seen.add(key)
+        out.append(p)
+    return out, skipped
+
+
 def cmd_import(args) -> int:
     config = json.loads(args.config.read_text(encoding="utf-8")) if args.config.exists() else {}
     accounts = config.setdefault("accounts", [])
     existing = {a["account_id"] for a in accounts}
-    proxies = read_lines(args.proxies) if args.proxies else []
+    proxies, skipped_proxies = _available_proxies(read_lines(args.proxies) if args.proxies else [], accounts)
 
     new = []
     updated = []
@@ -275,10 +319,12 @@ def cmd_import(args) -> int:
             entry["proxy"] = proxies[len(new)]
         new.append(entry)
 
+    if skipped_proxies:
+        print(f"note: {skipped_proxies} proxy line(s) skipped (already assigned in the config, or duplicate)")
     if proxies and len(proxies) < len(new):
-        print(f"warning: {len(new) - len(proxies)} of {len(new)} new accounts got no proxy (only {len(proxies)} given)")
+        print(f"warning: {len(new) - len(proxies)} of {len(new)} new accounts got no proxy (only {len(proxies)} free)")
     if proxies and len(proxies) > len(new):
-        print(f"note: {len(proxies) - len(new)} proxies were not used")
+        print(f"note: {len(proxies) - len(new)} free proxies were not used")
     print(f"{len(new)} account(s) to add, {len(existing)} already in {args.config}, email added to {len(updated)}")
     if args.dry_run or not (new or updated):
         return 0
@@ -356,7 +402,9 @@ def build_parser() -> argparse.ArgumentParser:
     with_accounts(sub.add_parser("forget", help="delete stored data of an account"), required=True).set_defaults(
         handler=cmd_forget
     )
-    importer = sub.add_parser("import", help="import login,password[,email or shared_secret] (or the same with ':') from a text file")
+    importer = sub.add_parser(
+        "import", help="import login,password[,email or shared_secret] (or the same with ':') from a text file"
+    )
     importer.add_argument("accounts", type=Path)
     importer.add_argument("--proxies", type=Path, help="one proxy per new account, in order")
     importer.add_argument("--logins-only", action="store_true", help="store only logins, ignore passwords")

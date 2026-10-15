@@ -65,6 +65,10 @@ class SteamGuardRequired(SteamAuthError):
     """Steam asks for a confirmation that cannot be completed automatically."""
 
 
+class SteamCredentialsRejected(SteamAuthError):
+    """Steam refused the username / password / Steam Guard code: retrying as-is cannot help."""
+
+
 # ── browser (Camoufox) ─────────────────────────────────────────────────────────
 
 
@@ -815,6 +819,7 @@ class Settings:
     manual: bool = False  # allow waiting for a human (Steam sign-in, Cloudflare check) in a visible window
     browser_os: str | list[str] | None = "windows"  # OS of the generated fingerprint
     browser_concurrency: int = 2  # parallel browser contexts
+    verify_jobs: int = 8  # parallel HTTP session checks before browser logins (login command)
     launch_timeout: float = 90
     navigation_timeout: float = 45
     challenge_timeout: float = 45
@@ -844,8 +849,8 @@ class Settings:
             raise ConfigError("settings.http_backend must be 'aiohttp' or 'httpx'")
         if self.window is not None and (len(self.window) != 2 or min(self.window) < 400):
             raise ConfigError("settings.window must be [width, height], both >= 400")
-        if self.browser_concurrency < 1 or self.login_attempts < 1 or self.http_retries < 0:
-            raise ConfigError("browser_concurrency and login_attempts must be >= 1, http_retries >= 0")
+        if self.browser_concurrency < 1 or self.login_attempts < 1 or self.http_retries < 0 or self.verify_jobs < 1:
+            raise ConfigError("browser_concurrency, login_attempts and verify_jobs must be >= 1, http_retries >= 0")
 
     @property
     def db_path(self) -> Path:

@@ -342,7 +342,9 @@ class CamoufoxAuthenticator:
                     )
                 if time.monotonic() > deadline:
                     where = urlsplit(page.url)
-                    submitted = f"approval POST answered {posts[-1]}" if posts else "the approval form was not submitted"
+                    submitted = (
+                        f"approval POST answered {posts[-1]}" if posts else "the approval form was not submitted"
+                    )
                     steam_says = await self._steam_error_text(page)
                     dump = await self._dump_page(page, aid, "openid-stuck")
                     raise BrowserTimeoutError(
